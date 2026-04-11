@@ -5,6 +5,8 @@ import cors from "cors";
 import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
+import { XMLParser } from "fast-xml-parser";
+import * as turf from "@turf/turf";
 
 /* =========================================================
  * 1) CONFIGURATION GÉNÉRALE
@@ -297,6 +299,243 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================================================
+ * 6bis) GRAPHE / KML
+ * =========================================================
+ * Objectif :
+ * - lire le fichier KML UNE FOIS
+ * - extraire les points (nodes)
+ * - générer un graphe
+ * - le mettre en cache
+ * - éviter de recalculer côté navigateur
+ * ========================================================= */
+
+// Chemins
+const KML_FILE = path.resolve("./public/lycee.kml");
+const GRAPH_CACHE_FILE = path.resolve("./graph_cache.json");
+
+// Graphe en mémoire
+let graphCache = null;
+
+/**
+ * Charger le cache JSON si existant
+ */
+function loadGraphCache() {
+  try {
+    if (!fs.existsSync(GRAPH_CACHE_FILE)) return null;
+    return JSON.parse(fs.readFileSync(GRAPH_CACHE_FILE, "utf-8"));
+  } catch (e) {
+    console.log("⚠️ loadGraphCache failed:", e?.message || e);
+    return null;
+  }
+}
+
+/**
+ * Sauvegarder le graphe en cache JSON
+ */
+function saveGraphCache(graph) {
+  try {
+    fs.writeFileSync(GRAPH_CACHE_FILE, JSON.stringify(graph, null, 2), "utf-8");
+  } catch (e) {
+    console.log("⚠️ saveGraphCache failed:", e?.message || e);
+  }
+}
+
+/**
+ * Génère un nom de nœud unique comme avant :
+ * A, B, C, ... Z, AA, AB, etc.
+ */
+function nodeName(i) {
+  let s = "";
+  while (i >= 0) {
+    s = String.fromCharCode(65 + (i % 26)) + s;
+    i = Math.floor(i / 26) - 1;
+  }
+  return s;
+}
+
+function asArray(v) {
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function parseKml(kmlText) {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    trimValues: true,
+  });
+
+  const json = parser.parse(kmlText);
+  const doc = json?.kml?.Document || json?.Document || null;
+
+  if (!doc) {
+    throw new Error("Structure KML invalide : Document introuvable");
+  }
+
+  const placemarks = [
+    ...asArray(doc.Placemark),
+    ...asArray(doc.Folder).flatMap((f) => asArray(f.Placemark)),
+  ];
+
+  const nodes = [];
+  const obstacles = [];
+
+  for (const p of placemarks) {
+    const name = String(p?.name || "");
+    const pointCoords = p?.Point?.coordinates;
+    const polyCoords =
+      p?.Polygon?.outerBoundaryIs?.LinearRing?.coordinates;
+
+    // ---- Cas 1 : point => nœud de graphe
+    if (pointCoords) {
+      const parts = String(pointCoords).trim().split(",");
+      if (parts.length >= 2) {
+        const lon = Number(parts[0]);
+        const lat = Number(parts[1]);
+
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+          nodes.push({
+            id: nodeName(nodes.length),
+            label: name || `Repère ${nodes.length + 1}`,
+            lat,
+            lon,
+          });
+        }
+      }
+    }
+
+    // ---- Cas 2 : polygone => obstacle
+    if (polyCoords) {
+      const coords = String(polyCoords)
+        .trim()
+        .split(/\s+/)
+        .map((c) => {
+          const [lon, lat] = c.split(",").map(Number);
+          return [lon, lat];
+        })
+        .filter(([lon, lat]) => Number.isFinite(lat) && Number.isFinite(lon));
+
+      if (coords.length >= 4) {
+        obstacles.push({
+          name,
+          coords,
+        });
+      }
+    }
+  }
+
+  return { nodes, obstacles };
+}
+
+/**
+ * Génère des liens entre tous les nœuds.
+ * ATTENTION :
+ * cette version est volontairement simple et ne tient
+ * pas encore compte des obstacles.
+ */
+function buildLinks(nodes, obstacles) {
+  const links = [];
+
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const n1 = nodes[i];
+      const n2 = nodes[j];
+
+      const line = turf.lineString([
+        [n1.lon, n1.lat],
+        [n2.lon, n2.lat],
+      ]);
+
+      let blocked = false;
+
+      for (const obs of obstacles) {
+        const polygon = turf.polygon([obs.coords]);
+
+        if (turf.lineIntersect(line, polygon).features.length > 0) {
+          blocked = true;
+          break;
+        }
+      }
+
+      if (blocked) continue;
+
+      const dist = turf.distance(
+        [n1.lon, n1.lat],
+        [n2.lon, n2.lat],
+        { units: "kilometers" }
+      ) * 1000;
+
+      links.push({
+        from: n1.id,
+        to: n2.id,
+        dist,
+      });
+    }
+  }
+
+  return links;
+}
+/**
+ * Construit le graphe complet depuis le fichier KML.
+ */
+function buildGraphFromKml() {
+  console.log("🗺️ Lecture KML depuis", KML_FILE);
+
+  if (!fs.existsSync(KML_FILE)) {
+    throw new Error(`Fichier KML introuvable : ${KML_FILE}`);
+  }
+
+  const kmlText = fs.readFileSync(KML_FILE, "utf-8");
+
+  const { nodes, obstacles } = parseKml(kmlText);
+  const links = buildLinks(nodes, obstacles);
+
+  const originNode = nodes.find((n) => n.id === "A") || nodes[0] || null;
+
+  console.log("✅ Graphe construit :", {
+    nodes: nodes.length,
+    obstacles: obstacles.length,
+    links: links.length,
+  });
+
+  return {
+    origin: originNode
+      ? { lat: originNode.lat, lon: originNode.lon, id: originNode.id }
+      : null,
+    nodes,
+    obstacles,
+    links,
+  };
+}
+
+/**
+ * Initialise le graphe :
+ * - charge depuis le cache si dispo
+ * - sinon reconstruit depuis le KML
+ */
+function initGraph() {
+  try {
+    graphCache = loadGraphCache();
+
+    if (graphCache) {
+      console.log("⚡ Graphe chargé depuis cache");
+      return;
+    }
+
+    graphCache = buildGraphFromKml();
+    saveGraphCache(graphCache);
+
+    console.log("💾 Graphe sauvegardé en cache");
+  } catch (e) {
+    console.log("❌ initGraph failed:", e?.message || e);
+    graphCache = null;
+  }
+}
+
+
+
+
+
+/* =========================================================
  * 7) ROUTES HTTP DE DEBUG / ÉTAT
  * ========================================================= */
 
@@ -467,6 +706,116 @@ app.post("/api/reset-target", (_req, res) => {
   res.json({ status: "ok" });
 });
 
+
+/**
+ * Retourne le graphe complet
+ */
+app.get("/api/graph", (_req, res) => {
+  if (!graphCache) {
+    return res.status(503).json({ ok: false });
+  }
+
+  res.json({
+    ok: true,
+    graph: graphCache
+  });
+});
+
+
+/**
+ * Appel robot à partir d'une lettre de position.
+ * Exemple:
+ *   POST /api/call-node
+ *   { "node": "C" }
+ *
+ * Le serveur cherche le nœud dans graphCache,
+ * récupère ses coordonnées, puis déclenche un appel normal.
+ */
+app.post("/api/call-node", (req, res) => {
+  console.log("📍 /api/call-node body=", req.body, "busy(before)=", busy);
+
+  if (busy) {
+    return res.status(409).json({ error: "robot_busy" });
+  }
+
+  // On accepte "node", "letter" ou "id"
+  const rawNode = req.body?.node ?? req.body?.letter ?? req.body?.id;
+
+  if (typeof rawNode !== "string" || !rawNode.trim()) {
+    return res.status(400).json({ error: "node requis (ex: A, B, C...)" });
+  }
+
+  // Normalisation : " c " -> "C"
+  const nodeId = rawNode.trim().toUpperCase();
+
+  if (!graphCache || !Array.isArray(graphCache.nodes) || graphCache.nodes.length === 0) {
+    return res.status(503).json({ error: "graph_not_ready" });
+  }
+
+  // Recherche du nœud par id logique
+  const node = graphCache.nodes.find((n) => String(n.id).toUpperCase() === nodeId);
+
+  if (!node) {
+    return res.status(404).json({
+      error: "node_not_found",
+      node: nodeId,
+    });
+  }
+
+  // Vérification coords
+  if (typeof node.lat !== "number" || typeof node.lon !== "number") {
+    return res.status(500).json({
+      error: "node_coordinates_invalid",
+      node: nodeId,
+    });
+  }
+
+  // On convertit le nœud en target géographique
+  updateTarget({
+    x: node.lat,
+    y: node.lon,
+  });
+
+  busy = true;
+
+  // Diffusion aux clients
+  broadcast({ type: "target", data: lastTarget });
+  broadcast({ type: "state", data: { busy } });
+  broadcast({
+    type: "appel",
+    data: {
+      t: Date.now(),
+      source: "http-call-node",
+      node: nodeId,
+    },
+  });
+
+  persist();
+
+  console.log("✅ call-node OK =>", {
+    node: nodeId,
+    lat: node.lat,
+    lon: node.lon,
+    busy,
+  });
+
+  res.json({
+    status: "ok",
+    node: {
+      id: node.id,
+      label: node.label ?? null,
+      lat: node.lat,
+      lon: node.lon,
+    },
+    target: lastTarget,
+    busy: true,
+  });
+});
+
+// Initialisation du graphe au démarrage du serveur
+initGraph();
+
+
 /* =========================================================
  * 9) DÉMARRAGE SERVEUR HTTP
  * ========================================================= */
@@ -475,4 +824,9 @@ app.listen(PORT_HTTP, () => {
   console.log(`✅ HTTP prêt : http://localhost:${PORT_HTTP}`);
   console.log(`✅ WS prêt   : ws://localhost:${PORT_WS}`);
   console.log(`✅ STATE_FILE: ${STATE_FILE}`);
+
+
+
+
+
 });
